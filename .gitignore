@@ -1,0 +1,17 @@
+# Node
+node_modules/
+dist/
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+
+# React/Vite
+/build/
+/.vite/
+
+# IDE
+.vscode/
+*.log
