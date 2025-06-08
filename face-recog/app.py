@@ -2,6 +2,7 @@ from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import face_recognition
+from fastapi import Request
 from datetime import datetime
 import io
 import numpy as np
@@ -85,3 +86,34 @@ async def recognize(file: UploadFile = File(...)):
             })
 
     return JSONResponse(content={"results": matches_result})
+
+
+
+@app.post("/chat")
+async def chat(request: Request):
+    body = await request.json()
+    query = body.get("message", "").lower()
+
+    if not REG_DB:
+        return {"answer": "No registrations yet."}
+
+    # --- Rule-based logic ---
+    if "how many" in query and "registered" in query:
+        return {"answer": f"There are {len(REG_DB)} registered people."}
+
+    elif "last" in query:
+        last = REG_DB[-1]
+        return {"answer": f"The last person registered was {last['name']} at {last['timestamp']}"}
+
+    elif "when" in query:
+        for entry in REG_DB:
+            if entry['name'].lower() in query:
+                return {"answer": f"{entry['name']} was registered at {entry['timestamp']}"}
+        return {"answer": "Person not found."}
+
+    elif "list" in query or "show all" in query:
+        names = ", ".join(entry["name"] for entry in REG_DB)
+        return {"answer": f"Registered people: {names}"}
+
+    else:
+        return {"answer": "Sorry, I didn't understand that. Try asking 'how many registered', 'when was X registered', or 'who was last'."}
