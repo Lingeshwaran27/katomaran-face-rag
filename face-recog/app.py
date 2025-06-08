@@ -1,16 +1,41 @@
-from fastapi import FastAPI, UploadFile, File, Form
+# ──────────────────────────────────────────────────────────────────────────────
+#  app.py  –  Face Recognition + MongoDB (accurate matching version)
+# ──────────────────────────────────────────────────────────────────────────────
+import io, os, logging
+from datetime import datetime
+
+import numpy as np
+import face_recognition
+from dotenv import load_dotenv
+from fastapi import FastAPI, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-import face_recognition
-from fastapi import Request
-from datetime import datetime
-import io
-import numpy as np
+from pymongo import MongoClient, errors
 
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s  %(levelname)s  %(message)s"
+)
 
-app = FastAPI()
+# ── Environment & DB ──────────────────────────────────────────────────────────
+load_dotenv()
+MONGO_URI  = os.getenv("MONGO_URI")
+DB_NAME    = os.getenv("DB_NAME", "katomaran")
+COLL_NAME  = os.getenv("COLLECTION", "faces")
 
-# CORS for the React dev server
+if not MONGO_URI:
+    raise RuntimeError("❌  MONGO_URI missing in .env")
+
+client = MongoClient(MONGO_URI)
+collection = client[DB_NAME][COLL_NAME]
+
+# ── Face-match hyper-parameters ───────────────────────────────────────────────
+# 0.4–0.5 is a practical sweet spot for dlib-HOG encodings.  Lower ⇒ stricter.
+FACE_DISTANCE_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", 0.47))
+
+# ── FastAPI setup ─────────────────────────────────────────────────────────────
+app = FastAPI(title="Katomaran Face API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,101 +44,118 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-REG_DB = []   # in-memory store
+# ── Helper funcs ──────────────────────────────────────────────────────────────
+def encode_image(file_bytes: bytes) -> list[float] | None:
+    """Return the first face-encoding in the image, or None."""
+    img = face_recognition.load_image_file(io.BytesIO(file_bytes))
+    enc = face_recognition.face_encodings(img)
+    return enc[0].tolist() if enc else None
 
-# ---------- ROUTES ----------
 
+# ── Routes ────────────────────────────────────────────────────────────────────
 @app.get("/")
-def root():
-    return {"msg": "API is up"}
+def root() -> dict:
+    return {"msg": "API OK"}
 
 @app.get("/entries")
 def list_entries():
-    return REG_DB
-
+    return list(collection.find({}, {"_id": 0}))
 
 @app.post("/register")
 async def register(
-    name: str = Form(...),          # ← tell FastAPI this comes from the form
+    name: str = Form(...),
     file: UploadFile = File(...)
 ):
-    image_bytes = await file.read()
+    try:
+        logging.info("Registering %s", name)
+        encoding = encode_image(await file.read())
+        if not encoding:
+            return JSONResponse({"error": "No face found"}, status_code=400)
 
-    # face_recognition expects a file-like object
-    img = face_recognition.load_image_file(io.BytesIO(image_bytes))
-    encodings = face_recognition.face_encodings(img)
+        # if user exists, append new encoding; else create new document
+        existing = collection.find_one({"name": name})
+        ts = datetime.utcnow().isoformat()
 
-    if not encodings:
-        return {"error": "No face found"}
+        if existing:
+            collection.update_one(
+                {"name": name},
+                {"$push": {"encodings": encoding}, "$set": {"updated": ts}}
+            )
+        else:
+            collection.insert_one(
+                {"name": name, "encodings": [encoding], "created": ts}
+            )
 
-    REG_DB.append(
-        {
-            "name": name,
-            "encoding": encodings[0].tolist(),
-            "timestamp": datetime.utcnow().isoformat(),
-        }
-    )
+        return {"status": "registered", "name": name, "timestamp": ts}
 
-    return {"status": "registered", "name": name, "timestamp": REG_DB[-1]["timestamp"]}
+    except errors.PyMongoError as e:
+        logging.error("Mongo error: %s", e)
+        return JSONResponse({"error": "DB error"}, status_code=500)
 
 @app.post("/recognize")
 async def recognize(file: UploadFile = File(...)):
-    if not REG_DB:
+    people = list(collection.find({}, {"_id": 0}))
+    if not people:
         return {"error": "No faces in database"}
 
-    image_bytes = await file.read()
-    img = face_recognition.load_image_file(io.BytesIO(image_bytes))
+    img_bytes = await file.read()
+    img = face_recognition.load_image_file(io.BytesIO(img_bytes))
+    locations  = face_recognition.face_locations(img)
+    encodings  = face_recognition.face_encodings(img, locations)
 
-    # Get face locations + encodings from incoming frame
-    face_locations = face_recognition.face_locations(img)
-    face_encodings = face_recognition.face_encodings(img, face_locations)
+    results = []
+    for loc, unknown in zip(locations, encodings):
+        # Flatten all known encodings + keep owner index
+        flat_encs   = []
+        owner_index = []  # parallel list to know which person each enc belongs to
+        for idx, p in enumerate(people):
+            for e in p["encodings"]:
+                flat_encs.append(np.array(e))
+                owner_index.append(idx)
 
-    matches_result = []
+        # Compute distances in one vectorised call
+        distances = face_recognition.face_distance(flat_encs, unknown)
+        best_idx  = int(np.argmin(distances))
+        best_dist = float(distances[best_idx])
 
-    for (top, right, bottom, left), face_encoding in zip(face_locations, face_encodings):
-        for person in REG_DB:
-            match = face_recognition.compare_faces([np.array(person['encoding'])], face_encoding)[0]
-            if match:
-                matches_result.append({
-                    "name": person['name'],
-                    "box": [top, right, bottom, left],
-                })
-                break
+        if best_dist < FACE_DISTANCE_THRESHOLD:
+            match_name = people[owner_index[best_idx]]["name"]
+            confidence = round(1 - best_dist, 3)
         else:
-            matches_result.append({
-                "name": "Unknown",
-                "box": [top, right, bottom, left],
-            })
+            match_name = "Unknown"
+            confidence = None
 
-    return JSONResponse(content={"results": matches_result})
+        top, right, bottom, left = loc
+        results.append({
+            "name": match_name,
+            "box": [top, right, bottom, left],
+            "confidence": confidence
+        })
 
-
+    return {"results": results}
 
 @app.post("/chat")
-async def chat(request: Request):
-    body = await request.json()
-    query = body.get("message", "").lower()
-
-    if not REG_DB:
+async def chat(req: Request):
+    q = (await req.json()).get("message", "").lower()
+    entries = list(collection.find({}, {"_id": 0}))
+    if not entries:
         return {"answer": "No registrations yet."}
 
-    # --- Rule-based logic ---
-    if "how many" in query and "registered" in query:
-        return {"answer": f"There are {len(REG_DB)} registered people."}
+    if "how many" in q and "registered" in q:
+        return {"answer": f"There are {len(entries)} registered people."}
 
-    elif "last" in query:
-        last = REG_DB[-1]
-        return {"answer": f"The last person registered was {last['name']} at {last['timestamp']}"}
+    if "last" in q:
+        last = max(entries, key=lambda d: d.get("updated", d.get("created")))
+        return {"answer": f"Last registered: {last['name']} at {last.get('updated', last['created'])}"}
 
-    elif "when" in query:
-        for entry in REG_DB:
-            if entry['name'].lower() in query:
-                return {"answer": f"{entry['name']} was registered at {entry['timestamp']}"}
+    if "when" in q:
+        for e in entries:
+            if e["name"].lower() in q:
+                ts = e.get("updated", e.get("created"))
+                return {"answer": f"{e['name']} registered at {ts}"}
         return {"answer": "Person not found."}
 
-    elif "list" in query or "show all" in query:
-        names = ", ".join(entry["name"] for entry in REG_DB)
-        return {"answer": f"Registered people: {names}"}
+    if "list" in q:
+        return {"answer": "Registered: " + ", ".join(e["name"] for e in entries)}
 
-    else:
-        return {"answer": "Sorry, I didn't understand that. Try asking 'how many registered', 'when was X registered', or 'who was last'."}
+    return {"answer": "Sorry, I didn't understand that."}
